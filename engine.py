@@ -36,34 +36,40 @@ DEVICE = torch.device(
 
 def compute_auto_params(frame: np.ndarray) -> dict:
     """
-    Hollywood cinema-standard anaglyph parameters.
+    Vibrant animated-style anaglyph parameters.
 
-    Key insight from Titanic/Avatar stereo conversion (Stereo D, fxguide 2012):
-    - Split parallax SYMMETRICALLY: both eyes move, not just one
-      Left eye moves LEFT by half_shift, Right eye moves RIGHT by half_shift
-      This places the convergence point AT screen — the cinema standard
-    - Avatar depth budget: ~50% strength, scene-managed
-    - Inpainting/occlusion fill is the most critical quality step
+    Tuned to match the style seen in animated 3D content (dinosaur/cartoon videos):
+    - Much larger total parallax budget (4.0% vs cinema 2.0%)
+      This gives the strong POP-OUT effect characteristic of animated 3D
+    - Higher depth strength (2.0–2.4) for dramatic foreground separation
+    - Strong color saturation boost so red/cyan channels are vivid
+    - Aggressive depth gamma so foreground objects leap out
+
+    The symmetric parallax model is kept (both eyes shift) — this gives
+    proper depth into AND out of screen, not just everything flying forward.
     """
     h, w = frame.shape[:2]
 
-    # ── Total parallax budget: 2.0% of width, split equally between eyes
-    # 1280px wide: total=25px → each eye shifts 12-13px
-    # 1920px wide: total=38px → each eye shifts 19px
-    # Stereo D / Avatar standard for comfortable cinema viewing
-    total_parallax = int(np.clip(w * 0.020, 16, 52))
-    half_shift     = total_parallax // 2   # each eye gets half
+    # ── LARGE parallax budget: 4.0% of width (2× cinema standard)
+    # 1280px wide: total=51px → each eye shifts 25px  (strong pop-out)
+    # 1920px wide: total=76px → each eye shifts 38px  (dramatic depth)
+    # Clamped at 90px max to avoid too much inpaint artifact on narrow images
+    total_parallax = int(np.clip(w * 0.040, 28, 90))
+    half_shift     = total_parallax // 2
 
-    # ── Depth strength: scene-adaptive, calibrated to Avatar's ~50% range
+    # ── Depth strength: high — animated content has clear foreground subjects
+    # Higher contrast scene → slightly lower (already has good separation)
+    # Lower contrast scene  → higher (need to push the depth harder)
     gray           = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     scene_contrast = gray.std() / 128.0
-    depth_strength = float(np.clip(1.40 - scene_contrast * 0.15, 1.10, 1.50))
+    depth_strength = float(np.clip(2.40 - scene_contrast * 0.25, 1.90, 2.50))
 
-    # ── Color boost: minimal — cinema anaglyphs use very subtle boost
-    color_boost = 0.32
+    # ── Color boost: strong — animated 3D uses vivid saturated channels
+    # This is the key to getting that vivid red/cyan pop seen in cartoon 3D
+    color_boost = 0.85
 
-    # ── Inpaint radius proportional to shift
-    inpaint_radius = max(3, half_shift // 3)
+    # ── Inpaint radius: scale with shift size
+    inpaint_radius = max(4, half_shift // 2)
 
     return {
         "base_shift":     half_shift,
@@ -105,7 +111,11 @@ def estimate_depth_ai(
     """
     Run Depth Anything V2 on one BGR frame.
     Returns float32 depth map [0..1] — 1.0 = closest to camera.
-    Output is same spatial size as input.
+    Post-processing tuned for vivid animated-style 3D:
+      - Stronger bilateral filter to keep crisp subject edges
+      - Higher CLAHE clipLimit (5.0) for max depth spread
+      - Aggressive gamma curve (power=0.35) so foreground objects
+        get disproportionately large shift → strong pop-out effect
     """
     rgb  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     inp  = processor(images=Image.fromarray(rgb), return_tensors="pt")
@@ -124,22 +134,27 @@ def estimate_depth_ai(
     mn, mx = pred.min(), pred.max()
     depth  = ((pred - mn) / (mx - mn + 1e-8)).astype(np.float32)
 
-    # ── Post-process depth map ─────────────────────────────────────
-    # 1. Light bilateral filter: smooths flat regions, preserves sharp edges
-    # FIX: reduced sigmaColor 0.1->0.08 and d=5->3 to avoid over-smoothing
-    # which caused depth inconsistency between similar regions
-    depth = cv2.bilateralFilter(depth, d=3, sigmaColor=0.08, sigmaSpace=4)
+    # ── Bilateral filter: stronger — keep subject edges razor sharp
+    depth = cv2.bilateralFilter(depth, d=7, sigmaColor=0.12, sigmaSpace=6)
 
-    # 2. CLAHE instead of full histogram equalization
-    # FIX: equalizeHist was too aggressive — created unnatural depth jumps
-    # causing temporal inconsistency (depth flicker) in video.
-    # CLAHE (Contrast Limited AHE) gives controlled, natural depth spread.
+    # ── CLAHE: higher clipLimit = maximum depth range spread
+    # This pushes near objects to full 1.0 and far objects to 0.0
+    # giving us the largest possible parallax differential
     depth_u8 = (depth * 255).astype(np.uint8)
-    # CLAHE: controlled depth spread — moderate clipLimit avoids
-    # the harsh depth jumps that cause eye strain on large screens
-    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))
+    clahe    = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(4, 4))
     depth_u8 = clahe.apply(depth_u8)
     depth    = depth_u8.astype(np.float32) / 255.0
+
+    # ── Aggressive gamma curve: power=0.35
+    # Foreground (depth=0.9) → 0.9^0.35 = 0.964  (+7% more shift)
+    # Midground  (depth=0.5) → 0.5^0.35 = 0.784  (+56% more shift)
+    # Background (depth=0.1) → 0.1^0.35 = 0.447  (+347% more shift)
+    # Net effect: subjects pop dramatically, background stays quiet
+    depth = np.power(depth, 0.35).astype(np.float32)
+
+    # ── Re-normalize after gamma
+    mn, mx = depth.min(), depth.max()
+    depth  = ((depth - mn) / (mx - mn + 1e-8)).astype(np.float32)
 
     return depth
 
@@ -147,8 +162,7 @@ def estimate_depth_ai(
 def estimate_depth_classical(frame_bgr: np.ndarray) -> np.ndarray:
     """
     Enhanced classical depth estimation fallback.
-    Uses edge detection + foreground detection + vertical cue.
-    Much better than the original luminance-only approach.
+    Tuned for vivid animated-style 3D output.
     """
     h, w = frame_bgr.shape[:2]
     cs   = max(8, h // 20)
@@ -167,25 +181,25 @@ def estimate_depth_classical(frame_bgr: np.ndarray) -> np.ndarray:
     # ── Vertical position cue ─────────────────────────────────────
     vert = np.linspace(0.15, 0.9, h).reshape(-1, 1) * np.ones((1, w))
 
-    # ── Edge detection (Laplacian of Gaussian for cleaner edges) ──
+    # ── Edge detection ────────────────────────────────────────────
     gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(frame_bgr, 30, 100).astype(np.float32) / 255.0
+    edges = cv2.Canny(gray, 30, 100).astype(np.float32) / 255.0
     edges = cv2.GaussianBlur(edges, (21, 21), 0)
 
     # ── Weighted combination ───────────────────────────────────────
-    depth = fg * 0.55 + vert * 0.25 + edges * 0.20
+    depth = fg * 0.60 + vert.astype(np.float32) * 0.25 + edges * 0.15
     depth = cv2.GaussianBlur(depth, (31, 31), 0)
 
-    # ── CLAHE for controlled depth spread (no aggressive jumps) ──
-    # FIX: equalizeHist caused unnatural depth jumps → flicker in video
+    # ── CLAHE: high clipLimit for maximum depth spread
     depth_u8 = (np.clip(depth, 0, 1) * 255).astype(np.uint8)
-    # CLAHE: controlled depth spread — moderate clipLimit avoids
-    # the harsh depth jumps that cause eye strain on large screens
-    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))
+    clahe    = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(4, 4))
     depth_u8 = clahe.apply(depth_u8)
     depth    = depth_u8.astype(np.float32) / 255.0
 
-    return depth
+    # ── Aggressive gamma curve for foreground pop
+    depth = np.power(depth, 0.35).astype(np.float32)
+    mn, mx = depth.min(), depth.max()
+    return ((depth - mn) / (mx - mn + 1e-8)).astype(np.float32)
 
 
 def get_depth(
@@ -264,44 +278,48 @@ def warp_eye(
 def make_anaglyph(
     left:  np.ndarray,
     right: np.ndarray,
-    boost: float = 0.48,
+    boost: float = 0.85,
 ) -> np.ndarray:
     """
-    Merge left and right eye views into red-cyan anaglyph.
+    Full-Color Vivid Anaglyph — tuned for animated/cartoon 3D style.
 
-    Color preservation strategy:
-    - Use luminance-weighted blending instead of hard channel selection
-    - This keeps more of the original hue visible through both lenses
-    - Reduces the "washed out" look of simple channel swap
+    This method uses ALL color channels from both eyes with strong
+    saturation boosting, giving the vivid red-cyan pop seen in
+    animated 3D videos (dinosaur/cartoon content).
 
-    Left eye  → Cyan channels (G + B)
-    Right eye → Red channel   (R)
+    Key differences from Half-Color method:
+    - Right eye: full RGB → R channel (not just luma). Preserves warm
+      tones and makes red objects really pop through the red lens.
+    - Left eye: full G+B channels with hue-boosted saturation.
+    - Stronger boost values push channels into vivid territory —
+      intentionally richer than cinema live-action standard.
+
+    Left eye  → Cyan (G channel boosted + B channel boosted)
+    Right eye → Red  (R channel strongly boosted)
     """
-    # Split channels — all float32 for precise arithmetic
     b_l, g_l, r_l = cv2.split(left.astype(np.float32))
     b_r, g_r, r_r = cv2.split(right.astype(np.float32))
 
-    # ── Red channel: PURE right-eye red only ─────────────────────
-    # FIX: removed 10% left-eye bleed (r_r*0.90 + r_l*0.10) which was
-    # the PRIMARY cause of the ghosting/shadow artifact in the video.
-    # Analysis showed R-G correlation was 0.77 (should be <0.50).
-    # Pure channel separation is the correct cinema anaglyph standard.
-    r_out = r_r * 1.0
+    # ── Red channel: right eye's full red, strongly boosted ──────
+    # This makes the red ghosting vivid — characteristic of the
+    # animated 3D style. Red lens pops objects forward dramatically.
+    r_out = r_r * (1.0 + boost * 0.90)
 
-    # ── Cyan channels: pure left-eye G and B ─────────────────────
-    # No mixing with right-eye channels — keeps separation clean
-    g_out = g_l * 1.0
-    b_out = b_l * 1.0
+    # ── Cyan channels: left eye G+B, both boosted ─────────────────
+    # Strong G boost → vivid cyan tint on background/environment
+    # Strong B boost → deep cyan on cool-toned objects (sky, water)
+    g_out = g_l * (1.0 + boost * 0.55)
+    b_out = b_l * (1.0 + boost * 0.70)
 
-    # ── Perceptual brightness compensation ───────────────────────
-    # Glasses lenses absorb light: red lens ~35% loss, cyan ~25% loss
-    # Boost each channel proportionally — lower values than before
-    # to prevent over-saturation that also causes ghosting perception
-    r_out = r_out * (1.0 + boost * 0.65)   # red lens compensation
-    g_out = g_out * (1.0 + boost * 0.10)   # cyan (green component)
-    b_out = b_out * (1.0 + boost * 0.35)   # cyan (blue component)
+    # ── Saturation punch: push each channel further from gray ─────
+    # This is the "cartoon vivid" trick — boost the deviation from
+    # mid-gray so the red and cyan separation feels intense
+    mid   = 128.0
+    r_out = mid + (r_out - mid) * 1.20   # 20% extra saturation on red
+    g_out = mid + (g_out - mid) * 1.10
+    b_out = mid + (b_out - mid) * 1.15
 
-    # ── Clip and convert ─────────────────────────────────────────
+    # ── Clip and pack ─────────────────────────────────────────────
     r_out = np.clip(r_out, 0, 255).astype(np.uint8)
     g_out = np.clip(g_out, 0, 255).astype(np.uint8)
     b_out = np.clip(b_out, 0, 255).astype(np.uint8)
